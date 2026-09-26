@@ -1,47 +1,46 @@
-import type { Client, ClientEvents } from "discord.js";
-import { readdirSync } from "node:fs";
-import { join, dirname } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
-import { logger } from "../utils/logger.js";
+import { mkdir } from "node:fs/promises";
+import { loadConfig } from "./config.js";
+import { deployCommands } from "./deploy-commands.js";
+import { loadCommands } from "./commands/index.js";
+import { loadEvents } from "./events/index.js";
+import { logger } from "./utils/logger.js";
+import { BotClient, setClient } from "./bot/client.js";
+import { StartupError, describeLoginFailure } from "./utils/errors.js";
 
-export interface BotEvent<K extends keyof ClientEvents = keyof ClientEvents> {
-  name: K;
-  once?: boolean;
-  execute: (...args: ClientEvents[K]) => void | Promise<void>;
-}
+async function main(): Promise<void> {
+  const config = loadConfig();
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
+  await mkdir(config.storage.dir, { recursive: true });
+  if (!config.storage.durable) {
+    logger.warn(
+      "PERSISTENT_DATA_DIR is not set — storing data locally, which is lost on redeploy. " +
+        "Enable persistent storage for this branch to keep it.",
+      { dir: config.storage.dir },
+    );
+  }
 
-export async function loadEvents(client: Client): Promise<void> {
-  const files = readdirSync(__dirname).filter(
-    (f) =>
-      (f.endsWith(".js") || f.endsWith(".ts")) &&
-      f !== "index.js" &&
-      f !== "index.ts",
-  );
+  await deployCommands(config);
 
-  for (const file of files) {
-    const filePath = join(__dirname, file);
-    const module = await import(pathToFileURL(filePath).href);
+  const client = new BotClient();
+  setClient(client);
+  const commands = await loadCommands();
+  commands.forEach((cmd, name) => client.commands.set(name, cmd));
 
-    if (!module.default) {
-      logger.warn("Event file is missing a default export — skipping.", {
-        file,
-      });
-      continue;
-    }
+  await loadEvents(client);
 
-    const event = module.default as BotEvent<any>;
-
-    if (event.once) {
-      client.once(event.name, (...args: any[]) => void event.execute(...args));
-    } else {
-      client.on(event.name, (...args: any[]) => void event.execute(...args));
-    }
-
-    logger.info("Registered event listener.", {
-      name: event.name,
-      once: event.once ?? false,
-    });
+  try {
+    await client.login(config.token);
+  } catch (err: unknown) {
+    throw describeLoginFailure(err);
   }
 }
+
+main().catch((err: unknown) => {
+  if (err instanceof StartupError) {
+    // The message already says what to fix — a stack trace would only bury it.
+    logger.error(err.message);
+  } else {
+    logger.error(err instanceof Error ? err : String(err));
+  }
+  process.exit(1);
+});
